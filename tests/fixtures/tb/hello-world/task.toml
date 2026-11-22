@@ -1,0 +1,35 @@
+schema_version = "1.1"
+artifacts = []
+
+[task]
+name = "agent-eval/hello-world"
+description = "agent-eval fixture: write one file."
+keywords = ["fixture", "shell"]
+
+[metadata]
+difficulty = "easy"
+category = "fixture"
+tags = ["fixture", "shell"]
+expert_time_estimate_min = 1.0
+
+[verifier]
+timeout_sec = 30.0
+
+[agent]
+timeout_sec = 30.0
+
+[environment]
+build_timeout_sec = 120.0
+docker_image = "docker.io/library/debian:bookworm-slim"
+cpus = 1
+memory_mb = 512
+storage_mb = 1024
+gpus = 0
+allow_internet = false
+mcp_servers = []
+
+[verifier.env]
+EXPECTED = "Hello, world!"
+
+[environment.env]
+GREETING = "Hello, world!"
