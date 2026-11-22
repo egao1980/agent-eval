@@ -103,8 +103,13 @@ sleep 20
 "))
                             (make-nop-agent))
                  'unsupported-task))
-    (ok (signals (run-trial (load-tb-task (write-tb-task root "gpu" :toml (toml-with "[environment]
-gpus = 1")))
+    (ok (signals (run-trial (load-tb-task (write-tb-task root "gpu" :toml "[task]
+name = \"t/gpu\"
+
+[environment]
+docker_image = \"docker.io/library/debian:bookworm-slim\"
+gpus = 1
+"))
                             (make-nop-agent))
                  'unsupported-task))))
 
