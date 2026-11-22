@@ -9,8 +9,14 @@
 ;;; RUN-TASK-STATS run → one plist per task that has trials, in dataset order:
 ;;;   (:task-id ID :n TRIALS :passed PASSED :mean-reward MEAN :pass-at-1 P)
 ;;;   MEAN the mean of rewards clamped to [0, 1]; P = PASSED / N.
-;;; RUN-PASS-AT-K run k → the mean of PASS-AT-K over the tasks with N >= K
-;;;   (exact); NIL when there is none.
+;;; RUN-PASS-AT-K run k → the mean over the tasks with N >= K trials of that
+;;;   task's pass@k, where C is the SUM OF ITS CLAMPED REWARDS (each reward
+;;;   clamped to [0, 1]), so partial credit counts: an integer C gives
+;;;   PASS-AT-K N C K; a fractional C is linear between PASS-AT-K at floor(C)
+;;;   and at ceiling(C). With 0/1 rewards it is the plain estimator; pass@1 is
+;;;   the task's mean clamped reward (one trial with reward 1/2 → pass@1 =
+;;;   1/2, where counting passed trials would give 0). Exact; NIL when no
+;;;   task has K trials.
 ;;; RUN-ACCURACY run → the mean clamped reward over all trials (Terminal-Bench's
 ;;;   accuracy); NIL when there are no trials.
 ;;; RUN-TOTALS run → (:trials N :input-tokens I :cache-tokens C :output-tokens

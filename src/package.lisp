@@ -35,7 +35,7 @@
    #:task-environment #:environment-task #:environment-trial-directory
    #:start-environment #:stop-environment #:environment-started-p
    #:environment-exec #:upload-path #:download-path #:environment-command-path
-   #:with-environment
+   #:with-environment #:env-export-script
    #:exec-result #:exec-result-exit-code #:exec-result-stdout #:exec-result-stderr
    #:exec-result-timed-out-p #:exec-result-duration-ms
    #:+output-cap+

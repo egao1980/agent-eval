@@ -141,3 +141,35 @@
            (environment-exec env "true")
            (environment-exec env "true")
            (ok (= (+ before 2) (backend-calls backend)))))))))
+
+;;; agent-eval#5: env values never on a command line
+
+(defclass recording-backend (compute:native-process-backend)
+  ((specs :initform '() :accessor recorded-specs)))
+
+(defmethod compute:run-sandboxed ((backend recording-backend) spec)
+  (push spec (recorded-specs backend))
+  (call-next-method))
+
+(deftest env-values-stay-off-argv
+  (testing "ENV-EXPORT-SCRIPT quotes values for sh"
+    (ok (equal (format nil "export A='x'\\''y'~%") (env-export-script '(("A" . "x'y")))))
+    (ok (signals (env-export-script '(("A B" . "1"))) 'agent-eval-error)))
+  (local-lane
+   (with-tmpdir (dir)
+     (let* ((secret "sk-test-SECRET-0042")
+            (backend (make-instance 'recording-backend))
+            (env (make-local-environment (hello-task) :directory dir :backend backend)))
+       (start-environment env)
+       (let ((r (environment-exec env "printf %s \"$OPENAI_API_KEY\""
+                                  :env (list (cons "OPENAI_API_KEY" secret)))))
+         (ok (equal secret (exec-result-stdout r)) "the command sees the value"))
+       (ok (plusp (length (recorded-specs backend))))
+       (ok (every (lambda (spec)
+                    (notany (lambda (word) (search secret (princ-to-string word)))
+                            (compute:sandbox-spec-command spec)))
+                  (recorded-specs backend))
+           "no argv the environment built holds the secret")
+       (ok (notany #'compute:sandbox-spec-env (recorded-specs backend)))
+       (ok (null (directory (merge-pathnames "exec/*.*" (truename dir))))
+           "the env file is gone after the command")))))

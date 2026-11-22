@@ -37,11 +37,16 @@
 ;;; AGENT-RUN: ENVIRONMENT-EXEC of the argv (WORKDIR = the command path of
 ;;; the task's work dir) in the work dir, timeout = the task's agent timeout,
 ;;; ENV plus CL_STACK_CODE_CONFIG_DIR (the command path of /logs/agent/config)
-;;; and CL_STACK_CODE_DATA_DIR (/logs/agent/data). stdout is written to
-;;; logs-directory/cl-stack-code.jsonl and stderr to
-;;; logs-directory/cl-stack-code.stderr, then CONTEXT-FROM-STREAM-JSON fills
-;;; the context. Then: a timeout → AGENT-TIMEOUT; a non-zero exit with no
-;;; "result" event → AGENT-FAILED (exit code). A "result" with an error
+;;; and CL_STACK_CODE_DATA_DIR (/logs/agent/data). The argv runs under
+;;; `sh -c 'exec "$@" >FILE'` with FILE the command path of
+;;; +STREAM-ENV-PATH+ (/logs/agent/cl-stack-code.jsonl), so the stream is not
+;;; subject to the EXEC-RESULT cap (+OUTPUT-CAP+) and a long run keeps its
+;;; final result event (agent-eval#2). After the run that file is fetched with
+;;; DOWNLOAD-PATH (uncapped; "" when missing), written to
+;;; logs-directory/cl-stack-code.jsonl, and parsed; stderr goes to
+;;; logs-directory/cl-stack-code.stderr (capped); CONTEXT-FROM-STREAM-JSON
+;;; fills the context. Then: a timeout → AGENT-TIMEOUT; a non-zero exit with
+;;; no "result" event → AGENT-FAILED (exit code). A "result" with an error
 ;;; subtype is not a failure (the run ended; the verifier decides).
 ;;;
 ;;; PARSE-STREAM-JSON text → a list of decoded objects, one per non-blank
@@ -53,11 +58,16 @@
 ;;;     inside input), CACHE-TOKENS = cache read, OUTPUT-TOKENS = output;
 ;;;   num_turns → TURNS; "result" → RESULT-TEXT; "subtype" → STATUS-DETAIL;
 ;;;   COST-USD = "total_cost_usd" when the event has it, else
-;;;   (USAGE-COST-USD usage prices) when PRICES, else NIL.
+;;;   (USAGE-COST-USD usage prices) when PRICES, else NIL. AGENT-RUN passes
+;;;   the agent's PRICES completed by %EFFECTIVE-PRICES: when neither
+;;;   :CACHE-READ nor :CACHE-WRITE is given, cache tokens are priced at
+;;;   :INPUT (Harbor counts cache inside input); when one is given, the other
+;;;   counts as 0.
 ;;; No result event → STATUS-DETAIL "no_result", the counts stay NIL.
 ;;; USAGE-COST-USD usage prices → (input×:input + output×:output +
-;;; cache-read×:cache-read + cache-write×:cache-write) / 10^6, a missing price
-;;; counting as 0; USAGE the decoded "usage" object.
+;;; cache-read×:cache-read + cache-write×:cache-write) / 10^6, a price missing
+;;; from PRICES counting as 0 (the adapter's fallback to :input is
+;;; %EFFECTIVE-PRICES, above); USAGE the decoded "usage" object.
 
 (defclass cl-stack-code-agent (agent-adapter)
   ((command :initarg :command :reader %csc-command)
@@ -233,10 +243,23 @@ missing one counts as 0 (USAGE-COST-USD)."
       (list* :cache-read (getf prices :input) :cache-write (getf prices :input) prices)
       prices))
 
+(defparameter +stream-env-path+ "/logs/agent/cl-stack-code.jsonl"
+  "Where, in the environment, a cl-stack-code run writes its stream-json.")
+
+(defun %fetch-stream (environment)
+  "The text of +STREAM-ENV-PATH+ in ENVIRONMENT, uncapped; \"\" when missing."
+  (uiop:with-temporary-file (:pathname tmp :type "jsonl")
+    (handler-case (progn (download-path environment +stream-env-path+ tmp)
+                         (%read-text-file tmp))
+      (environment-error () ""))))
+
 (defmethod agent-run ((agent cl-stack-code-agent) instruction environment context)
   (let* ((task (environment-task environment))
-         (argv (cl-stack-code-argv agent instruction
-                                   (environment-command-path environment (task-workdir task))))
+         (argv (list* "sh" "-c" "o=$1; shift; exec \"$@\" >\"$o\"" "agent-eval"
+                      (environment-command-path environment +stream-env-path+)
+                      (cl-stack-code-argv agent instruction
+                                          (environment-command-path environment
+                                                                    (task-workdir task)))))
          (result (environment-exec
                   environment argv
                   :timeout (task-agent-timeout task)
@@ -245,7 +268,7 @@ missing one counts as 0 (USAGE-COST-USD)."
                                            (environment-command-path environment "/logs/agent/config"))
                                      (cons "CL_STACK_CODE_DATA_DIR"
                                            (environment-command-path environment "/logs/agent/data"))))))
-         (stdout (exec-result-stdout result)))
+         (stdout (%fetch-stream environment)))
     (%write-agent-log context "cl-stack-code.jsonl" stdout)
     (%write-agent-log context "cl-stack-code.stderr" (exec-result-stderr result))
     (let ((events (parse-stream-json stdout)))

@@ -1,10 +1,10 @@
 (defsystem "agent-eval"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "Agent evals on eval-protocol (stack-agent-eval): an agent adapter protocol (cl-stack-code -p first), a Terminal-Bench task loader, task environments on compute-protocol, grading through the task's tests, eval-protocol run records with pass@k, tokens, cost, time and transcripts, and run comparisons"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "eval-protocol" "0.3.0")
-               (:version "compute-protocol" "0.2.0")
+               (:version "compute-protocol" "0.4.0")
                (:version "json-protocol" "0.2.1")
                "json-backend-jzon"
                (:version "toml-protocol" "0.1.0")
@@ -29,24 +29,24 @@
   :in-order-to ((test-op (test-op "agent-eval/tests"))))
 
 ;;; The container environment: Terminal-Bench semantics (one container per
-;;; trial, living across agent setup, the agent and the verifier) need warm
-;;; podman sessions, writable mounts and file copy: compute-backend-podman
-;;; 0.3.0 (egao1980/compute-backend-podman#3, egao1980/compute-protocol#10).
-;;; Not a dependency of the test system: tests/container-test.lisp loads it at
-;;; run time when podman and that backend version are present, else skips.
+;;; trial, living across agent setup, the agent and the verifier) on warm
+;;; podman sessions, :rw mounts, podman cp and podman build
+;;; (compute-backend-podman 0.3.0, compute-protocol 0.4.0).
 (defsystem "agent-eval/podman"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "agent-eval container environment on compute-protocol's podman backend"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "agent-eval" "0.1.0")
-               "compute-backend-podman")
+  :depends-on ((:version "agent-eval" "0.2.0")
+               (:version "compute-protocol" "0.4.0")
+               (:version "compute-backend-podman" "0.3.0"))
   :serial t
   :pathname "src/podman"
   :components ((:file "environment")))
 
 (defsystem "agent-eval/tests"
-  :depends-on ("agent-eval" "eval-protocol" "compute-protocol" "json-protocol" "rove")
+  :depends-on ("agent-eval" "agent-eval/podman" "eval-protocol" "compute-protocol"
+               "json-protocol" "rove")
   :pathname "tests"
   :serial t
   :components ((:file "package")
