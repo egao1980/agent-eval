@@ -65,12 +65,27 @@
 (defgeneric agent-run (adapter instruction environment context))
 (defgeneric agent-populate-context (adapter context))
 
-(defclass agent-context () ()
-  (:documentation "What an agent run produced (stub)."))
+(defmethod agent-name ((adapter agent-adapter))
+  (string-downcase (symbol-name (class-name (class-of adapter)))))
 
-(defun make-agent-context (&key logs-directory)
-  (declare (ignore logs-directory))
-  (%e0-pending 'make-agent-context))
+(defmethod agent-version ((adapter agent-adapter))
+  nil)
+
+(defmethod agent-config ((adapter agent-adapter))
+  (list :name (agent-name adapter)))
+
+(defmethod agent-setup ((adapter agent-adapter) environment)
+  (declare (ignore environment))
+  nil)
+
+(defmethod agent-run ((adapter agent-adapter) instruction environment context)
+  (declare (ignore instruction environment context))
+  (error 'agent-eval-error
+         :message (format nil "~a has no AGENT-RUN method" (agent-name adapter))))
+
+(defmethod agent-populate-context ((adapter agent-adapter) context)
+  (declare (ignore context))
+  nil)
 
 (defgeneric context-input-tokens (context))
 (defgeneric context-cache-tokens (context))
@@ -92,18 +107,126 @@
 (defgeneric (setf context-transcript) (value context))
 (defgeneric (setf context-metadata) (value context))
 
-(defclass nop-agent (agent-adapter) ())
-(defclass oracle-agent (agent-adapter) ())
-(defclass command-agent (agent-adapter) ())
+(defclass agent-context ()
+  ((input-tokens :initform nil :accessor context-input-tokens)
+   (cache-tokens :initform nil :accessor context-cache-tokens)
+   (output-tokens :initform nil :accessor context-output-tokens)
+   (cost-usd :initform nil :accessor context-cost-usd)
+   (turns :initform nil :accessor context-turns)
+   (result-text :initform nil :accessor context-result-text)
+   (status-detail :initform nil :accessor context-status-detail)
+   (transcript :initform nil :accessor context-transcript)
+   (metadata :initform nil :accessor context-metadata)
+   (logs-directory :initarg :logs-directory :initform nil :reader context-logs-directory))
+  (:documentation "What an agent run produced (Harbor's AgentContext)."))
+
+(defun make-agent-context (&key logs-directory)
+  "A fresh AGENT-CONTEXT whose adapter logs go to LOGS-DIRECTORY (or nowhere)."
+  (make-instance 'agent-context
+                 :logs-directory (and logs-directory
+                                      (uiop:ensure-directory-pathname logs-directory))))
+
+;;; Helpers shared by the built-in adapters
+
+(defun %write-agent-log (context name text)
+  "Write TEXT to CONTEXT's logs-directory/NAME when it has a logs directory."
+  (let ((dir (context-logs-directory context)))
+    (when dir
+      (%write-text-file (merge-pathnames name dir) text))))
+
+(defun %agent-verdict (task result)
+  "Signal AGENT-TIMEOUT or AGENT-FAILED for an agent command's RESULT."
+  (cond ((exec-result-timed-out-p result)
+         (error 'agent-timeout :task-id (task-id task) :seconds (task-agent-timeout task)
+                               :message "the agent command timed out"))
+        ((not (eql 0 (exec-result-exit-code result)))
+         (error 'agent-failed :task-id (task-id task) :exit-code (exec-result-exit-code result)
+                              :message "the agent command exited non-zero"))))
+
+(defun %output-text (result)
+  (concatenate 'string (exec-result-stdout result) (exec-result-stderr result)))
+
+;;; nop
+
+(defclass nop-agent (agent-adapter) ()
+  (:documentation "Harbor's nop agent: does nothing."))
 
 (defun make-nop-agent ()
-  (%e0-pending 'make-nop-agent))
+  (make-instance 'nop-agent))
+
+(defmethod agent-name ((agent nop-agent)) "nop")
+
+(defmethod agent-run ((agent nop-agent) instruction environment context)
+  (declare (ignore instruction environment context))
+  nil)
+
+;;; oracle
+
+(defclass oracle-agent (agent-adapter) ()
+  (:documentation "Harbor's oracle agent: runs the task's solution/solve.sh."))
 
 (defun make-oracle-agent ()
-  (%e0-pending 'make-oracle-agent))
+  (make-instance 'oracle-agent))
 
-(defun make-command-agent (&key command env name)
-  (declare (ignore command env name))
-  (%e0-pending 'make-command-agent))
+(defmethod agent-name ((agent oracle-agent)) "oracle")
+
+(defmethod agent-run ((agent oracle-agent) instruction environment context)
+  (declare (ignore instruction))
+  (let ((task (environment-task environment)))
+    (unless (task-solution-p task)
+      (error 'task-format-error :path (task-directory task) :field :solution
+                                :message "no solution/solve.sh"))
+    (upload-path environment
+                 (merge-pathnames "solution/" (uiop:ensure-directory-pathname (task-directory task)))
+                 "/solution")
+    (let ((result (environment-exec environment
+                                    (list "bash" (environment-command-path environment
+                                                                           "/solution/solve.sh"))
+                                    :timeout (task-agent-timeout task))))
+      (%write-agent-log context "oracle.log" (%output-text result))
+      (setf (context-status-detail context)
+            (if (exec-result-timed-out-p result)
+                "timeout"
+                (format nil "exit ~a" (exec-result-exit-code result))))
+      (%agent-verdict task result))))
+
+;;; command
 
 (defgeneric command-agent-command (agent))
+
+(defclass command-agent (agent-adapter)
+  ((command :initarg :command :reader command-agent-command)
+   (env :initarg :env :reader %command-agent-env)
+   (name :initarg :name :reader %command-agent-name))
+  (:documentation "Runs a fixed command in the work dir with the instruction in
+$AGENT_EVAL_INSTRUCTION."))
+
+(defun make-command-agent (&key command env name)
+  "A COMMAND-AGENT running COMMAND (a non-empty list of strings)."
+  (unless (and (consp command) (every #'stringp command))
+    (error 'agent-eval-error
+           :message (format nil "a command agent needs a non-empty list of strings, not ~s"
+                            command)))
+  (unless (or (null name) (stringp name))
+    (error 'agent-eval-error :message (format nil "the agent name must be a string, not ~s" name)))
+  (make-instance 'command-agent :command (copy-list command) :env (copy-alist env)
+                                :name (or name "command")))
+
+(defmethod agent-name ((agent command-agent))
+  (%command-agent-name agent))
+
+(defmethod agent-config ((agent command-agent))
+  (list :name (agent-name agent) :command (command-agent-command agent)))
+
+(defmethod agent-run ((agent command-agent) instruction environment context)
+  (let* ((task (environment-task environment))
+         (result (environment-exec environment (command-agent-command agent)
+                                   :timeout (task-agent-timeout task)
+                                   :env (append (%command-agent-env agent)
+                                                (list (cons "AGENT_EVAL_INSTRUCTION" instruction))))))
+    (%write-agent-log context "command.log" (%output-text result))
+    (setf (context-status-detail context)
+          (if (exec-result-timed-out-p result)
+              "timeout"
+              (format nil "exit ~a" (exec-result-exit-code result))))
+    (%agent-verdict task result)))

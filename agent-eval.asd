@@ -10,11 +10,13 @@
                (:version "toml-protocol" "0.1.0")
                "toml-backend-tomlet"
                (:version "crypto-protocol" "0.2.0")
-               "crypto-backend-ironclad")
+               "crypto-backend-ironclad"
+               "encoding-protocol")
   :serial t
   :pathname "src"
   :components ((:file "package")
                (:file "conditions")
+               (:file "util")
                (:file "tasks")
                (:file "environments")
                (:file "agents")

@@ -39,15 +39,134 @@
 
 (defparameter +minimum-podman-backend-version+ "0.3.0")
 
-(defclass container-environment (task-environment) ()
-  (:documentation "A task environment in one podman container (stub)."))
-
-(defun make-container-environment (task &key directory backend image)
-  (declare (ignore task directory backend image))
-  (error "make-container-environment is not implemented yet (E0 contract)"))
-
 (defgeneric container-environment-image (environment))
 (defgeneric container-environment-backend (environment))
 
-(defun podman-backend-ready-p ()
+(defclass container-environment (task-environment)
+  ((task :initarg :task :reader environment-task)
+   (trial-directory :initarg :directory :reader environment-trial-directory)
+   (backend :initarg :backend :reader container-environment-backend)
+   (image :initarg :image :reader container-environment-image)
+   (session :initform nil :accessor %session))
+  (:documentation "A task environment in one podman container, alive from
+START-ENVIRONMENT to STOP-ENVIRONMENT (compute-backend-podman >= 0.3.0)."))
+
+(defmethod environment-started-p ((environment container-environment))
+  (and (%session environment) t))
+
+(defun %podman-call (name &rest args)
+  "Call compute-backend-podman's NAME (an 0.3.0 export, absent from 0.2.0),
+so this file compiles against either version."
+  (apply #'uiop:symbol-call :compute-backend-podman name args))
+
+(defun %task-image-tag (task)
+  (format nil "agent-eval/~(~a~):~a" (task-id task)
+          (subseq (getf (task-spec task) :files-sha256) 0 12)))
+
+(defun make-container-environment (task &key directory backend image)
+  "A CONTAINER-ENVIRONMENT for TASK (see the header). No image and no
+Dockerfile → UNSUPPORTED-TASK."
+  (let* ((dir (if directory
+                  (agent-eval::%directory-truename directory)
+                  (agent-eval::%fresh-directory "agent-eval-trial")))
+         (backend (or backend (compute-backend-podman:make-podman-compute-backend)))
+         (image (or image
+                    (task-image task)
+                    (and (task-dockerfile-p task)
+                         (%podman-call '#:podman-build-image
+                                       (merge-pathnames "environment/"
+                                                        (uiop:ensure-directory-pathname
+                                                         (task-directory task)))
+                                       :tag (%task-image-tag task)))
+                    (error 'unsupported-task :task-id (task-id task)
+                                             :reason "no image and no Dockerfile"
+                                             :message "no image and no Dockerfile"))))
+    (make-instance 'container-environment :task task :directory dir
+                                          :backend backend :image image)))
+
+(defmethod environment-command-path ((environment container-environment) env-path)
+  env-path)
+
+(defmethod start-environment ((environment container-environment))
+  (unless (%session environment)
+    (let* ((task (environment-task environment))
+           (logs (merge-pathnames "logs/" (environment-trial-directory environment))))
+      (dolist (sub '("agent/" "verifier/"))
+        (ensure-directories-exist (merge-pathnames sub logs)))
+      (handler-case
+          (setf (%session environment)
+                (compute:open-sandbox
+                 (container-environment-backend environment)
+                 (compute:make-sandbox-spec
+                  :runtime (container-environment-image environment)
+                  :cpu-limit (task-cpus task)
+                  :memory-limit (* (task-memory-mb task) (expt 2 20))
+                  :network (if (task-allow-internet-p task) :allow :none)
+                  :mounts (list (list (uiop:native-namestring logs) "/logs" :rw)))))
+        (compute:compute-error (c)
+          (error 'environment-error :task-id (task-id task) :phase :environment-setup
+                                    :message (princ-to-string c))))
+      (let ((r (environment-exec environment
+                                 (list "mkdir" "-p" (task-workdir task) "/logs/agent" "/logs/verifier")
+                                 :directory "/")))
+        (unless (eql 0 (exec-result-exit-code r))
+          (stop-environment environment)
+          (error 'environment-error :task-id (task-id task) :phase :environment-setup
+                                    :message (exec-result-stderr r))))))
+  environment)
+
+(defmethod stop-environment ((environment container-environment))
+  (let ((session (%session environment)))
+    (when session
+      (setf (%session environment) nil)
+      (handler-case (compute:close-sandbox session)
+        (compute:compute-error (c)
+          (error 'environment-error :task-id (task-id (environment-task environment))
+                                    :phase :stop :message (princ-to-string c))))))
   nil)
+
+(defmethod agent-eval::%run-command ((environment container-environment) argv
+                                     &key directory env timeout)
+  (let ((spec (compute:make-sandbox-spec
+               ;; compute-protocol has no :directory yet (compute-protocol#10).
+               :command (list* "sh" "-c" "cd \"$1\" || exit 125; shift; exec \"$@\""
+                               "agent-eval" directory argv)
+               :env env
+               :wall-clock timeout)))
+    (let ((result (handler-case
+                      (handler-bind ((compute:sandbox-timeout
+                                       (lambda (c)
+                                         (let ((r (find-restart 'compute:abort-execution c)))
+                                           (when r (invoke-restart r))))))
+                        (compute:run-sandboxed (%session environment) spec))
+                    (compute:compute-error (c)
+                      (error 'environment-error :task-id (task-id (environment-task environment))
+                                                :message (princ-to-string c))))))
+      (if result
+          (values (compute:sandbox-result-exit-code result)
+                  (compute:sandbox-result-stdout result)
+                  (compute:sandbox-result-stderr result)
+                  nil)
+          (values nil "" "" t)))))
+
+(defmethod upload-path ((environment container-environment) host-path env-path)
+  (%podman-call '#:podman-copy-to (%session environment) host-path env-path))
+
+(defmethod download-path ((environment container-environment) env-path host-path)
+  (ensure-directories-exist host-path)
+  (%podman-call '#:podman-copy-from (%session environment) env-path host-path))
+
+(defun podman-backend-ready-p ()
+  "T when the loaded compute-backend-podman is >= +MINIMUM-PODMAN-BACKEND-VERSION+
+and `podman info` succeeds (through compute-protocol). Never signals."
+  (handler-case
+      (let ((system (asdf:find-system "compute-backend-podman" nil)))
+        (and system
+             (asdf:component-version system)
+             (uiop:version<= +minimum-podman-backend-version+ (asdf:component-version system))
+             (let ((r (compute:run-sandboxed (compute:make-native-process-backend)
+                                             (compute:make-sandbox-spec
+                                              :command '("podman" "info") :wall-clock 60))))
+               (and r (eql 0 (compute:sandbox-result-exit-code r))))
+             t))
+    (error () nil)))
