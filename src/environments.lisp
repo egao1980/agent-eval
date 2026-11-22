@@ -54,10 +54,12 @@
 ;;; built and commands are NOT rewritten: a script that writes to /logs on
 ;;; the host is not confined. Fixture scripts use $AGENT_EVAL_LOGS_DIR
 ;;; (falling back to /logs, so the same script runs in a container). Each
-;;; command runs through COMPUTE:RUN-SANDBOXED on BACKEND, in the mapped
-;;; DIRECTORY, network :ALLOW when the task allows internet else :NONE, with
-;;; the spec's wall clock = TIMEOUT; a COMPUTE:SANDBOX-TIMEOUT becomes
-;;; TIMED-OUT-P.
+;;; command runs through COMPUTE:RUN-SANDBOXED on BACKEND, the spec's
+;;; :DIRECTORY the mapped DIRECTORY (compute-protocol >= 0.4.0), network
+;;; :ALLOW when the task allows internet else :NONE, with the spec's wall
+;;; clock = TIMEOUT; a COMPUTE:SANDBOX-TIMEOUT becomes TIMED-OUT-P. The
+;;; process group, the output files and the exported env are workarounds for
+;;; egao1980/compute-protocol#12 (see +LOCAL-WRAPPER+).
 
 (defparameter +output-cap+ 1048576
   "Characters of stdout / stderr an EXEC-RESULT keeps.")
@@ -170,6 +172,9 @@ is %RUN-COMMAND."
 
 ;;; The local environment
 
+(defgeneric local-environment-root (environment))
+(defgeneric local-environment-host-path (environment env-path))
+
 (defclass local-environment (task-environment)
   ((task :initarg :task :reader environment-task)
    (trial-directory :initarg :directory :reader environment-trial-directory)
@@ -192,9 +197,6 @@ default); nothing is confined."))
                    :directory dir
                    :root (merge-pathnames "root/" dir)
                    :backend (or backend (compute:make-native-process-backend)))))
-
-(defgeneric local-environment-root (environment))
-(defgeneric local-environment-host-path (environment env-path))
 
 (defmethod local-environment-host-path ((environment local-environment) env-path)
   (check-type env-path string)
@@ -245,17 +247,23 @@ ENVIRONMENT-ERROR."
       (%environment-error environment "~a" c))))
 
 (defparameter +local-wrapper+
-  "cd \"$1\" || exit 125; o=$2; e=$3; p=$4; shift 4
+  "o=$1; e=$2; p=$3; shift 3
 while [ $# -gt 0 ] && [ \"$1\" != -- ]; do export \"$1\" || exit 125; shift; done; shift
 set -m
 \"$@\" >\"$o\" 2>\"$e\" </dev/null &
 c=$!
 printf '%s\\n' \"$c\" >\"$p\"
 wait \"$c\""
-  "bash -c script run by the local environment: cd to $1, export the K=V
-arguments before --, then run the argv after -- in its own process group
-(set -m) with stdout / stderr to the files $2 / $3, writing its pid (= its
-process group) to $4.")
+  "bash -c script run by the local environment (in the command's directory,
+compute-protocol's :DIRECTORY): export the K=V arguments before --, then run
+the argv after -- in its own process group (set -m) with stdout / stderr to
+the files $1 / $2, writing its pid (= its process group) to $3.
+Workarounds for egao1980/compute-protocol#12, still open with 0.4.0: the
+native backend's timeout kills only the direct child (so the command gets its
+own group, killed by %KILL-PROCESS-GROUP), :ENV replaces the whole
+environment (so variables are exported here, over the inherited one), and a
+grandchild holding the output pipe delays the return (so output goes to files,
+read after exit). Drop them when #12 is fixed.")
 
 (defun %kill-process-group (environment pgid-file)
   "Kill the process group named in PGID-FILE (a timed-out command and its
@@ -283,7 +291,6 @@ children), through compute-protocol."
       (unwind-protect
            (let* ((spec (compute:make-sandbox-spec
                          :command (list* "bash" "-c" +local-wrapper+ "agent-eval"
-                                         (uiop:native-namestring cwd)
                                          (uiop:native-namestring out)
                                          (uiop:native-namestring err)
                                          (uiop:native-namestring pid)
@@ -292,6 +299,7 @@ children), through compute-protocol."
                                                          env)
                                                  (list "--")
                                                  argv))
+                         :directory (uiop:native-namestring cwd)
                          :network (if (task-allow-internet-p (environment-task environment))
                                       :allow :none)
                          :wall-clock timeout))

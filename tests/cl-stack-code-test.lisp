@@ -122,6 +122,20 @@
        (ok (equal "success" (context-status-detail ctx)))
        (ok (equal "Created hello.txt" (context-result-text ctx)))))))
 
+(deftest stream-is-not-capped
+  (local-lane
+   (testing "a stream longer than +OUTPUT-CAP+ keeps its final result event (agent-eval#2)"
+     (let ((agent-eval::+output-cap+ 200))
+       (multiple-value-bind (env ctx err) (run-in-env (fake-agent) (hello-task))
+         (declare (ignore env))
+         (ok (null err))
+         (ok (equal "success" (context-status-detail ctx)))
+         (ok (= 135 (context-input-tokens ctx)))
+         (ok (< 200 (length (uiop:read-file-string
+                             (merge-pathnames "cl-stack-code.jsonl"
+                                              (context-logs-directory ctx)))))
+             "the kept stream is whole"))))))
+
 (deftest settings-file
   (local-lane
    (let ((settings (json:decode "{\"maxTurns\":3,\"appendSystemPrompt\":\"x\"}")))
