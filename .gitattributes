@@ -1,0 +1,7 @@
+* text=auto
+*.lisp text eol=lf
+*.asd text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.jsonl text eol=lf
+tests/fixtures/** -text
