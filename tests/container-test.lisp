@@ -105,18 +105,27 @@ name = \"t/built\"
       (ok (equal "1" (second (member "--cpus" argv :test #'equal))))
       (testing "the trial's logs/ is mounted :rw at /logs"
         (ok (equal (format nil "~a:/logs:rw"
-                           (string-right-trim "/" (uiop:native-namestring
-                                                   (merge-pathnames "logs/" (truename dir)))))
+                           (string-right-trim "/\\" (uiop:native-namestring
+                                                     (merge-pathnames "logs/" (truename dir)))))
                    (second (member "-v" argv :test #'equal)))))
       (ok (equal '("--entrypoint" "sleep" "img:1" "infinity") (last argv 4))))))
 
 (deftest container-exec-argv
-  (let ((argv (compute-backend-podman:podman-exec-argv
-               "cid" (agent-eval/podman:container-exec-spec
-                      '("bash" "-c" "pwd") :directory "/app" :env '(("A" . "1"))
-                                           :timeout 5))))
-    (ok (equal '("podman" "exec" "-w" "/app" "-e" "A=1" "cid" "bash" "-c" "pwd") argv)
-        "the work dir is podman exec -w: no cd wrapper"))
+  (let* ((secret "sk-test-SECRET-0042")
+         (spec (agent-eval/podman:container-exec-spec
+                '("bash" "-c" "pwd") :directory "/app"
+                                     :env (list (cons "A" "1") (cons "OPENAI_API_KEY" secret))
+                                     :timeout 5))
+         (argv (compute-backend-podman:podman-exec-argv "cid" spec)))
+    (ok (equal '("podman" "exec" "-i" "-w" "/app" "cid" "sh" "-c") (subseq argv 0 8))
+        "the work dir is podman exec -w: no cd wrapper; env on stdin (-i), no -e")
+    (ok (equal '("agent-eval" "bash" "-c" "pwd") (last argv 4)))
+    (ok (notany (lambda (word) (search secret word)) argv)
+        "the secret value is in no argv word (agent-eval#5)")
+    (ok (search (format nil "export OPENAI_API_KEY='~a'" secret)
+                (compute:sandbox-spec-input spec))
+        "it travels on stdin")
+    (ok (null (compute:sandbox-spec-env spec))))
   (ok (= 5 (compute:sandbox-spec-wall-clock
             (agent-eval/podman:container-exec-spec '("true") :timeout 5)))))
 
@@ -127,7 +136,7 @@ name = \"t/built\"
       (multiple-value-bind (mkdir source dest)
           (agent-eval/podman:container-copy-to-plan (path-in dir "tests/") "/tests")
         (ok (equal "/tests" mkdir))
-        (ok (equal (format nil "~a/." (string-right-trim "/" (uiop:native-namestring
+        (ok (equal (format nil "~a/." (string-right-trim "/\\" (uiop:native-namestring
                                                               (truename (path-in dir "tests/")))))
                    source))
         (ok (equal "/tests" dest))))
@@ -176,6 +185,10 @@ name = \"t/built\"
               (ok (equal (format nil "kept~%")
                          (exec-result-stdout (environment-exec env "cat /tmp/state.txt"))))
               (ok (equal (format nil "/app~%") (exec-result-stdout (environment-exec env "pwd"))))
+              (testing "env reaches the command, quoting intact"
+                (ok (equal "it's a $x"
+                           (exec-result-stdout
+                            (environment-exec env "printf %s \"$V\"" :env '(("V" . "it's a $x")))))))
               (testing "network off when the task forbids internet"
                 (ok (not (eql 0 (exec-result-exit-code
                                  (environment-exec env "getent hosts example.com" :timeout 10))))))

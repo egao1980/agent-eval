@@ -26,6 +26,9 @@
 ;;;     TIMED-OUT-P T and EXIT-CODE NIL; no condition is signalled. A command
 ;;;     that cannot be started → ENVIRONMENT-ERROR. Not started →
 ;;;     ENVIRONMENT-ERROR "environment is not started".
+;;;     No ENV value is ever put in an argv (argv is visible in ps): each
+;;;     backend passes ENV-EXPORT-SCRIPT text through a private file (local)
+;;;     or stdin (container) (agent-eval#5).
 ;;;     Every command sees AGENT_EVAL_WORKDIR, AGENT_EVAL_LOGS_DIR and
 ;;;     AGENT_EVAL_TESTS_DIR: the command paths (ENVIRONMENT-COMMAND-PATH) of
 ;;;     the work dir, /logs and /tests, with no trailing separator.
@@ -145,6 +148,32 @@ started signals ENVIRONMENT-ERROR."))
           (cons "AGENT_EVAL_LOGS_DIR" (p "/logs"))
           (cons "AGENT_EVAL_TESTS_DIR" (p "/tests")))))
 
+(defun %env-name-p (name)
+  (and (plusp (length name))
+       (let ((c (char name 0))) (or (char= c #\_) (and (alpha-char-p c) (< (char-code c) 128))))
+       (every (lambda (c) (or (char= c #\_) (and (alphanumericp c) (< (char-code c) 128)))) name)))
+
+(defun %sh-quote (text)
+  "TEXT as one POSIX sh word in single quotes."
+  (with-output-to-string (s)
+    (write-char #\' s)
+    (loop for c across text
+          do (if (char= c #\') (write-string "'\\''" s) (write-char c s)))
+    (write-char #\' s)))
+
+(defun env-export-script (env)
+  "ENV (an alist of (NAME . VALUE) strings) as POSIX sh text of `export
+NAME='VALUE'` lines, for a command to source or eval: the way environments
+pass variables WITHOUT putting values in any argv (agent-eval#5; argv is
+visible to every local user in ps). A name that is not a shell identifier →
+AGENT-EVAL-ERROR."
+  (with-output-to-string (s)
+    (loop for (name . value) in env
+          do (unless (%env-name-p name)
+               (error 'agent-eval-error
+                      :message (format nil "not an environment variable name: ~s" name)))
+             (format s "export ~a=~a~%" name (%sh-quote value)))))
+
 (defmethod environment-exec ((environment task-environment) command &key timeout directory env)
   "The protocol rules every backend shares (see the header); the backend part
 is %RUN-COMMAND."
@@ -181,7 +210,8 @@ is %RUN-COMMAND."
    (root :initarg :root :reader local-environment-root)
    (backend :initarg :backend :reader %local-backend)
    (started-p :initform nil :accessor environment-started-p)
-   (exec-count :initform 0 :accessor %exec-count))
+   (exec-count :initform 0 :accessor %exec-count)
+   (exec-dir-private-p :initform nil :accessor %exec-dir-private-p))
   (:documentation "A trusted, path-mapped host directory: the environment path
 /P is ROOT/P. Commands run on a compute-protocol backend (native by
 default); nothing is confined."))
@@ -226,6 +256,8 @@ default); nothing is confined."))
         (error 'environment-error :task-id (task-id (environment-task environment))
                                   :phase :environment-setup
                                   :message (princ-to-string c))))
+    (%private-exec-directory environment
+                             (merge-pathnames "exec/" (environment-trial-directory environment)))
     (setf (environment-started-p environment) t))
   environment)
 
@@ -247,17 +279,20 @@ ENVIRONMENT-ERROR."
       (%environment-error environment "~a" c))))
 
 (defparameter +local-wrapper+
-  "o=$1; e=$2; p=$3; shift 3
-while [ $# -gt 0 ] && [ \"$1\" != -- ]; do export \"$1\" || exit 125; shift; done; shift
+  "o=$1; e=$2; p=$3; v=$4; shift 4
+. \"$v\" || exit 125
+rm -f \"$v\"
 set -m
 \"$@\" >\"$o\" 2>\"$e\" </dev/null &
 c=$!
 printf '%s\\n' \"$c\" >\"$p\"
 wait \"$c\""
   "bash -c script run by the local environment (in the command's directory,
-compute-protocol's :DIRECTORY): export the K=V arguments before --, then run
-the argv after -- in its own process group (set -m) with stdout / stderr to
-the files $1 / $2, writing its pid (= its process group) to $3.
+compute-protocol's :DIRECTORY): source the env file $4 (ENV-EXPORT-SCRIPT
+text, in the 0700 exec/ directory) and delete it, then run the argv in its
+own process group (set -m) with stdout / stderr to the files $1 / $2, writing
+its pid (= its process group) to $3. No env value is ever an argv word
+(agent-eval#5).
 Workarounds for egao1980/compute-protocol#12, still open with 0.4.0: the
 native backend's timeout kills only the direct child (so the command gets its
 own group, killed by %KILL-PROCESS-GROUP), :ENV replaces the whole
@@ -278,6 +313,19 @@ children), through compute-protocol."
                                   :wall-clock 30))
         (compute:compute-error () nil)))))
 
+(defun %private-exec-directory (environment base)
+  "Make BASE (the trial's exec/) mode 0700 through compute-protocol, once per
+environment, before any env file is written there."
+  (unless (%exec-dir-private-p environment)
+    (let ((r (%sandboxed environment (%local-backend environment)
+                         (compute:make-sandbox-spec
+                          :command (list "sh" "-c" "mkdir -p \"$1\" && chmod 700 \"$1\""
+                                         "agent-eval" (uiop:native-namestring base))
+                          :wall-clock 30))))
+      (unless (and r (eql 0 (compute:sandbox-result-exit-code r)))
+        (%environment-error environment "cannot make ~a private" (uiop:native-namestring base))))
+    (setf (%exec-dir-private-p environment) t)))
+
 (defmethod %run-command ((environment local-environment) argv &key directory env timeout)
   (let ((cwd (%host-directory (local-environment-host-path environment directory))))
     (unless (uiop:directory-exists-p cwd)
@@ -286,19 +334,18 @@ children), through compute-protocol."
            (base (merge-pathnames "exec/" (environment-trial-directory environment)))
            (out (merge-pathnames (format nil "~d.out" n) base))
            (err (merge-pathnames (format nil "~d.err" n) base))
-           (pid (merge-pathnames (format nil "~d.pid" n) base)))
-      (ensure-directories-exist base)
+           (pid (merge-pathnames (format nil "~d.pid" n) base))
+           (vars (merge-pathnames (format nil "~d.env" n) base)))
+      (%private-exec-directory environment base)
+      (%write-text-file vars (env-export-script env))
       (unwind-protect
            (let* ((spec (compute:make-sandbox-spec
                          :command (list* "bash" "-c" +local-wrapper+ "agent-eval"
                                          (uiop:native-namestring out)
                                          (uiop:native-namestring err)
                                          (uiop:native-namestring pid)
-                                         (append (mapcar (lambda (pair)
-                                                           (format nil "~a=~a" (car pair) (cdr pair)))
-                                                         env)
-                                                 (list "--")
-                                                 argv))
+                                         (uiop:native-namestring vars)
+                                         argv)
                          :directory (uiop:native-namestring cwd)
                          :network (if (task-allow-internet-p (environment-task environment))
                                       :allow :none)
@@ -311,7 +358,7 @@ children), through compute-protocol."
                     (%kill-process-group environment pid)
                     (values nil (%read-text-file out) (%read-text-file err) t))
                    (t (%environment-error environment "the command was aborted: ~s" argv))))
-        (dolist (f (list out err pid))
+        (dolist (f (list out err pid vars))
           (uiop:delete-file-if-exists f))))))
 
 (defun %copy-on-backend (environment from to)

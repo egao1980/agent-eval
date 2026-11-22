@@ -41,8 +41,12 @@
 ;;;   DIRECTORY/logs/ mounted :rw at /logs (agent and verifier logs land on the
 ;;;   host as they are written).
 ;;; CONTAINER-EXEC-SPEC argv &key directory env timeout → the SANDBOX-SPEC of
-;;;   one command on the session: :command ARGV, :directory DIRECTORY (podman
-;;;   exec -w), :env ENV (-e K=V), :wall-clock TIMEOUT.
+;;;   one command on the session: :command ("sh" "-c" +EXEC-WRAPPER+
+;;;   "agent-eval" ARGV…), :input (ENV-EXPORT-SCRIPT ENV), :directory
+;;;   DIRECTORY (podman exec -w), :wall-clock TIMEOUT, no :env. The wrapper
+;;;   evals stdin, then execs ARGV with stdin at EOF: env values travel on
+;;;   podman exec's stdin, never as `-e K=V` argv words visible in ps
+;;;   (agent-eval#5).
 ;;; CONTAINER-COPY-TO-PLAN host-path env-path → (values MKDIR SOURCE DEST) for
 ;;;   UPLOAD-PATH: a host directory → (ENV-PATH "<host>/." ENV-PATH), so its
 ;;;   contents land in ENV-PATH; a file → DEST = ENV-PATH (or ENV-PATH plus the
@@ -117,9 +121,15 @@ compute-protocol session), alive from START-ENVIRONMENT to STOP-ENVIRONMENT."))
      :network (if (task-allow-internet-p task) :allow :none)
      :mounts (list (list (uiop:native-namestring logs) "/logs" :rw)))))
 
+(defparameter +exec-wrapper+ "eval \"$(cat)\" || exit 125; exec \"$@\""
+  "sh -c script of every container command: export the variables read from
+stdin, then exec the argv.")
+
 (defun container-exec-spec (argv &key directory env timeout)
   "The SANDBOX-SPEC of one command on the session (see the header)."
-  (compute:make-sandbox-spec :command argv :directory directory :env env
+  (compute:make-sandbox-spec :command (list* "sh" "-c" +exec-wrapper+ "agent-eval" argv)
+                             :input (env-export-script env)
+                             :directory directory
                              :wall-clock timeout))
 
 (defun %parent (env-path)
@@ -135,8 +145,8 @@ compute-protocol session), alive from START-ENVIRONMENT to STOP-ENVIRONMENT."))
   (if (%host-directory-p host-path)
       (values env-path
               (concatenate 'string
-                           (string-right-trim "/" (uiop:native-namestring
-                                                   (uiop:ensure-directory-pathname host-path)))
+                           (string-right-trim "/\\" (uiop:native-namestring
+                                                     (uiop:ensure-directory-pathname host-path)))
                            "/.")
               env-path)
       (let ((dest (if (and (plusp (length env-path))
