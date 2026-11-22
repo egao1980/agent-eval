@@ -1,0 +1,32 @@
+#!/bin/sh
+# Test double for `cl-stack-code -p ... --output-format stream-json`
+# (cl-stack-code 0.10.0 event shapes). It records its argv, acts on --cwd,
+# and prints a recorded stream. FAKE_CSC_MODE: ok (default), fail, sleep,
+# max-turns.
+cwd=.
+prev=
+for a in "$@"; do
+  if [ "$prev" = "--cwd" ]; then cwd="$a"; fi
+  prev="$a"
+done
+logs="${AGENT_EVAL_LOGS_DIR:-/logs}/agent"
+mkdir -p "$logs"
+printf '%s\n' "$@" > "$logs/fake-argv.txt"
+printf '%s\n' "${CL_STACK_CODE_CONFIG_DIR:-}" > "$logs/fake-config-dir.txt"
+mode="${FAKE_CSC_MODE:-ok}"
+echo '{"type":"system","subtype":"init","session_id":"0f0f","cwd":".","model":"fake","tools":["bash","write"]}'
+case "$mode" in
+  fail) echo "fake-cl-stack-code: model unreachable" >&2; exit 1 ;;
+  sleep) sleep 30 ;;
+esac
+echo ''
+echo 'not json: a stray log line'
+echo '{"type":"assistant","step":1,"content":[{"type":"tool_use","id":"t1","name":"write","input":{"path":"hello.txt"}}],"usage":{"input_tokens":60,"output_tokens":12}}'
+if [ "$mode" = "max-turns" ]; then
+  echo '{"type":"result","subtype":"error_max_turns","is_error":true,"result":"","error":"max turns","num_turns":1,"duration_ms":7,"usage":{"input_tokens":60,"output_tokens":12,"cache_read_tokens":0,"cache_write_tokens":0},"permission_denials":[],"session_id":"0f0f"}'
+  exit 0
+fi
+printf 'Hello, world!\n' > "$cwd/hello.txt"
+echo '{"type":"tool_result","step":1,"id":"t1","name":"write","status":"done","is_error":false,"content":"wrote hello.txt"}'
+echo '{"type":"assistant","step":2,"content":[{"type":"text","text":"Created hello.txt"}],"usage":{"input_tokens":40,"output_tokens":8}}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"Created hello.txt","error":null,"num_turns":2,"duration_ms":12,"usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":30,"cache_write_tokens":5},"permission_denials":[],"session_id":"0f0f"}'

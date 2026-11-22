@@ -1,0 +1,9 @@
+schema_version = "1.1"
+
+[task]
+name = "agent-eval/partial-credit"
+
+[metadata]
+difficulty = "medium"
+category = "fixture"
+tags = ["fixture"]
